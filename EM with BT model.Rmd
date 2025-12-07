@@ -1,0 +1,368 @@
+---
+title: "Final_Project"
+author: "Shiyuan Zhang"
+date: "2025-11-15"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(nflreadr)
+library(dplyr)
+library(ggplot2)
+```
+
+---
+
+# Step 1: Data Preparation
+
+```{r}
+# Load play-by-play dataset
+Games<- load_schedules(2023:2025) %>%
+  filter(game_type == "REG")
+
+# Extract final game-level scores
+game_scores <- Games %>% 
+  group_by(game_id, home_team, away_team) %>% 
+  summarize(
+    home_score = max(home_score, na.rm = FALSE),
+    away_score = max(away_score, na.rm = FALSE)
+  )
+
+# Convert to Bradley–Terry pairwise comparison form
+bt_data <- game_scores %>%
+  mutate(
+    team1 = home_team,
+    team2 = away_team,
+    team1_win = ifelse(home_score > away_score, 1,
+                       ifelse(home_score < away_score, 0, NA))
+  ) %>%
+  select(team1, team2, team1_win)
+
+bt_data2 <- game_scores %>%
+  mutate(
+    season = Games$season[match(game_id, Games$game_id)],
+    team1 = home_team,
+    team2 = away_team,
+    team1_win = case_when(
+      home_score > away_score ~ 1,
+      home_score < away_score ~ 0,
+      TRUE ~ NA_real_
+    )
+  ) %>%
+  select(season, team1, team2, team1_win)
+
+bt_train <- bt_data2 %>% filter(season %in% c(2023, 2024))
+bt_test  <- bt_data2 %>% filter(season == 2025)
+
+head(game_scores)
+head(bt_data)
+head(bt_train)
+head(bt_test)
+```
+
+---
+
+# Step 2: Initialize Bradley–Terry EM Parameters
+```{r}
+teams <- unique(c(bt_train$team1, bt_train$team2))
+
+train_wins_mat <- matrix(0, length(teams), length(teams), dimnames = list(teams, teams))
+train_plays_mat <- matrix(0, length(teams), length(teams), dimnames = list(teams, teams))
+
+for (r in 1:nrow(bt_train)) {
+  t1 <- bt_train$team1[r]
+  t2 <- bt_train$team2[r]
+  w1 <- bt_train$team1_win[r]
+
+  train_wins_mat[t1, t2] <- train_wins_mat[t1, t2] + w1
+  train_wins_mat[t2, t1] <- train_wins_mat[t2, t1] + (1 - w1)
+
+  train_plays_mat[t1, t2] <- train_plays_mat[t1, t2] + 1
+  train_plays_mat[t2, t1] <- train_plays_mat[t2, t1] + 1
+}
+
+train_wins_mat[1:5, 1:5]
+train_plays_mat[1:5, 1:5]
+```
+
+```{r}
+teams <- unique(c(bt_data$team1, bt_data$team2))
+
+wins_mat <- matrix(0, length(teams), length(teams), dimnames = list(teams, teams))
+plays_mat <- matrix(0, length(teams), length(teams), dimnames = list(teams, teams))
+
+for (r in 1:nrow(bt_data)) {
+  t1 <- bt_data$team1[r]
+  t2 <- bt_data$team2[r]
+  w1 <- bt_data$team1_win[r]
+
+  wins_mat[t1, t2] <- wins_mat[t1, t2] + w1
+  wins_mat[t2, t1] <- wins_mat[t2, t1] + (1 - w1)
+
+  plays_mat[t1, t2] <- plays_mat[t1, t2] + 1
+  plays_mat[t2, t1] <- plays_mat[t2, t1] + 1
+}
+
+wins_mat[1:5, 1:5]
+plays_mat[1:5, 1:5]
+```
+
+---
+
+# Step 3: EM Algorithm Implementation
+E-step: for NA, use the current theta to estimate the win rate.
+```{r}
+E_step <- function(bt_data, theta) {
+  teams <- unique(c(bt_data$team1, bt_data$team2))
+  n <- length(teams)
+  team_idx <- setNames(1:n, teams)
+  
+  wins_mat <- matrix(0, n, n, dimnames = list(teams, teams))
+  plays_mat <- matrix(0, n, n, dimnames = list(teams, teams))
+  
+  for (r in 1:nrow(bt_data)) {
+    t1 <- bt_data$team1[r]
+    t2 <- bt_data$team2[r]
+    w1 <- bt_data$team1_win[r]
+    
+    i <- team_idx[t1]
+    j <- team_idx[t2]
+
+    if (is.na(w1)) {
+      w1 <- theta[i] / (theta[i] + theta[j])
+    }
+    
+    wins_mat[i, j] <- wins_mat[i, j] + w1
+    wins_mat[j, i] <- wins_mat[j, i] + (1 - w1)
+    plays_mat[i, j] <- plays_mat[i, j] + 1
+    plays_mat[j, i] <- plays_mat[j, i] + 1
+  }
+  
+  return(list(wins_mat = wins_mat, plays_mat = plays_mat))
+}
+```
+
+M step: update theta
+```{r}
+M_step <- function(wins_mat, plays_mat, theta) {
+  n <- length(theta)
+  theta_new <- theta
+  
+  for (i in 1:n) {
+    w_i <- sum(wins_mat[i, ])
+    denom <- sum(plays_mat[i, -i] / (theta[i] + theta[-i]))
+    theta_new[i] <- w_i / denom
+  }
+  
+  return(theta_new)
+}
+```
+
+EM Algorithm loop
+```{r}
+EM_BT <- function(bt_data, theta_init, max_iter = 500, tol = 1e-6) {
+  theta <- theta_init
+  n <- length(theta)
+  
+  for (iter in 1:max_iter) {
+    e_step_res <- E_step(bt_data, theta)
+    wins_mat <- e_step_res$wins_mat
+    plays_mat <- e_step_res$plays_mat
+
+    theta_new <- M_step(wins_mat, plays_mat, theta)
+
+    theta_new <- theta_new / sum(theta_new) * n
+
+    diff <- sqrt(sum((theta_new - theta)^2))
+    cat(sprintf("Iter %d | L2 diff = %.6f\n", iter, diff))
+    if (diff < tol) {
+      cat("Converged!\n")
+      break
+    }
+    
+    theta <- theta_new
+  }
+  
+  return(round(theta, 4))
+}
+
+teams <- unique(c(bt_data$team1, bt_data$team2))
+theta_init <- rep(1, length(teams))
+
+theta_est <- EM_BT(bt_data, theta_init)
+theta_est
+
+team_strength <- data.frame(team = teams, strength = theta_est)
+team_strength
+```
+
+```{r}
+team_strength %>%
+  # winner = team abbreviation column from your code
+  ggplot(aes(
+    x = reorder(team, strength), 
+    y = strength
+  )) +
+  geom_col(fill = "steelblue")+
+  coord_flip() +
+  labs(
+    x = "Team",
+    y = "Strength",
+    title = "Team Strength"
+  ) +
+  theme_minimal()
+```
+
+```{r}
+teams <- unique(c(bt_train$team1, bt_train$team2))
+theta_init_train <- rep(1, length(teams))
+theta_est_train <- EM_BT(bt_train, theta_init_train)
+team_strength_train <- data.frame(team = teams, strength = theta_est_train)
+team_strength_train
+```
+
+---
+
+# Step 4: predict the 2025
+```{r}
+schedule_2025 <- load_schedules(2025) %>%
+  filter(game_type == "REG")  %>%
+  select(home_team, away_team)
+```
+
+```{r}
+predict_win_prob <- function(h, a, theta, teams){
+  th <- theta[which(teams == h)]
+  ta <- theta[which(teams == a)]
+  return(th / (th + ta))
+}
+
+schedule_2025$home_win_prob <- mapply(
+  predict_win_prob,
+  schedule_2025$home_team,
+  schedule_2025$away_team,
+  MoreArgs = list(theta = theta_est, teams = teams)
+)
+```
+
+```{r}
+pred_wins <- rep(0, length(teams))
+names(pred_wins) <- teams
+
+for (k in 1:nrow(schedule_2025)) {
+  h <- schedule_2025$home_team[k]
+  a <- schedule_2025$away_team[k]
+  
+  p_home <- schedule_2025$home_win_prob[k]
+  
+  pred_wins[h] <- pred_wins[h] + p_home
+  pred_wins[a] <- pred_wins[a] + (1 - p_home)
+}
+
+predicted_2025_wins <- data.frame(
+  team = teams,
+  expected_wins = pred_wins
+) %>% arrange(desc(expected_wins))
+
+rownames(predicted_2025_wins) <- NULL
+predicted_2025_wins
+```
+
+```{r}
+sched_2025 <- load_schedules(2025)
+
+home_wins <- sched_2025 %>%
+  mutate(win_home = ifelse(home_score > away_score, 1, 0)) %>%
+  group_by(home_team) %>%
+  summarise(actual_home_wins = sum(win_home, na.rm = TRUE))
+
+away_wins <- sched_2025 %>%
+  mutate(win_away = ifelse(away_score > home_score, 1, 0)) %>%
+  group_by(away_team) %>%
+  summarise(actual_away_wins = sum(win_away, na.rm = TRUE))
+
+wins_so_far <- full_join(home_wins, away_wins,
+                         by = c("home_team" = "away_team")) %>%
+  mutate(
+    team = home_team,
+    wins_so_far = actual_home_wins + actual_away_wins
+  ) %>%
+  select(team, wins_so_far)
+
+results <- predicted_2025_wins %>%
+  left_join(wins_so_far, by = "team")
+
+results <- results %>%
+  mutate(
+    expected_future_wins = expected_wins - wins_so_far
+  ) %>%
+  select(team, wins_so_far, expected_future_wins, expected_wins) %>%
+  arrange(desc(abs(wins_so_far)))     
+
+print(results)
+```
+
+```{r}
+results %>%
+  # winner = team abbreviation column from your code
+  ggplot(aes(
+    x = reorder(team, expected_wins), 
+    y = expected_wins
+  )) +
+  geom_col(fill = "steelblue")+
+  coord_flip() +
+  labs(
+    x = "Team",
+    y = "Total Expected Wins",
+    title = "Expexted 2025 Total Wins"
+  ) +
+  theme_minimal()
+```
+
+```{r}
+# 1. Bradley–Terry prediction function
+predict_bt_prob <- function(team1, team2, theta) {
+  t1 <- theta[team1]
+  t2 <- theta[team2]
+  return(t1 / (t1 + t2))
+}
+
+# 2. Convert theta estimates from training into named vector
+theta_vec <- team_strength_train$strength
+names(theta_vec) <- team_strength_train$team
+
+# 3. Predict 2025 test games
+bt_test$pred_prob <- mapply(
+  predict_bt_prob,
+  bt_test$team1,
+  bt_test$team2,
+  MoreArgs = list(theta = theta_vec)
+)
+
+# Convert probability to 0/1 prediction
+bt_test$pred_win <- ifelse(bt_test$pred_prob > 0.5, 1, 0)
+
+# 4. Compute accuracy
+accuracy <- mean(bt_test$pred_win == bt_test$team1_win, na.rm = TRUE)
+
+# 5. Print results
+print(paste("BT Model Test Accuracy:", round(accuracy, 4)))
+```
+
+```{r}
+results %>%
+  arrange(expected_future_wins) %>%
+  ggplot(aes(x = reorder(team, expected_future_wins),
+             y = expected_future_wins)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  labs(
+    x = "Team",
+    y = "Expected Future Wins",
+    title = "Expected Future Wins by Team"
+  ) +
+  theme_minimal()
+```
+
