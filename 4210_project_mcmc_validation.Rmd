@@ -1,0 +1,146 @@
+---
+title: "4210 Final Project"
+output: pdf_document
+date: "2025-11-28"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Setup
+
+```{r}
+library(nflreadr)
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(purrr)
+library(tibble)
+library(readr)
+library(ggplot2)
+library(rstan)
+library(bayesplot)
+
+rstan_options(auto_write = TRUE)
+set.seed(123)
+```
+
+# Step 1: Data Prep
+
+```{r echo=FALSE}
+
+# Load 2023-2024 games
+games <- load_schedules(2023:2025) %>%
+  filter(game_type == "REG") %>% 
+  filter(!is.na(result)) %>%
+  mutate(home_win = ifelse(result > 0, 1, 0))
+
+# Create a mapping of Team Name
+teams <- sort(unique(c(games$home_team, games$away_team)))
+team_map <- data.frame(team = teams, id = 1:length(teams))
+
+# Join IDs back to the games data
+games_modeled <- games %>%
+  left_join(team_map, by = c("home_team" = "team")) %>%
+  rename(home_id = id) %>%
+  left_join(team_map, by = c("away_team" = "team")) %>%
+  rename(away_id = id)
+
+# Split: First 80% Train, Last 20% Test (To simulate predicting the future)
+#split_idx <- floor(0.8 * nrow(games_modeled))
+#train_data <- games_modeled[1:split_idx, ]
+#test_data  <- games_modeled[(split_idx + 1):nrow(games_modeled), ]
+train_data <- games_modeled %>%
+  filter(season < 2025) %>%       # Only past seasons
+  filter(!is.na(result)) %>%      # Must have a result
+  mutate(home_win = ifelse(result > 0, 1, 0))
+
+test_data <- games_modeled %>%
+  filter(season == 2025) %>%      # Current season
+  filter(!is.na(result)) %>%      # Only games that have happened
+  mutate(home_win = ifelse(result > 0, 1, 0))
+
+# Prepare data list for Stan
+stan_data <- list(
+  N_train = nrow(train_data),
+  home_team_train = train_data$home_id,
+  away_team_train = train_data$away_id,
+  home_win_train = train_data$home_win,
+  
+  N_test = nrow(test_data),
+  home_team_test = test_data$home_id,
+  away_team_test = test_data$away_id,
+  
+  N_teams = nrow(team_map)
+)
+```
+
+# Step 2: 
+
+```{r}
+# 2. Compile the Model
+stan_model_path <- "nfl_model.stan"
+stan_model_obj <- stan_model(file = stan_model_path)
+
+# 3. Run MCMC (Using YOUR method)
+fit <- sampling(
+  stan_model_obj, data = stan_data,
+  iter = 2000, warmup = 1000, chains = 4, seed = 4210,
+  control = list(adapt_delta = 0.9, max_treedepth = 10)
+)
+
+# Print results (Looking at Home Advantage 'alpha' and Variation 'sigma')
+print(fit, pars = c("alpha", "sigma"), probs = c(0.05, 0.5, 0.95))
+
+# 4. Extract posterior samples
+posterior <- rstan::extract(fit)
+posterior_array <- as.array(fit)
+
+mcmc_trace(posterior_array, pars = c("alpha", "sigma"))
+mcmc_pairs(posterior_array, pars = c("alpha", "sigma"))
+
+# Analyze testing set predictions (y_new_rep)
+# Note: y_new_rep here contains PROBABILITIES of home win
+test_preds <- apply(posterior$y_new_rep, 2, function(x) {
+  c(mean = mean(x), 
+    sd = sd(x), 
+    lower_5 = quantile(x, 0.05),
+    upper_95 = quantile(x, 0.95))
+}) %>% t() %>% as.data.frame()
+
+# Attach True Outcomes from the Test Set
+test_preds$true_temp <- test_data$home_win
+test_preds$obs_id <- 1:nrow(test_preds)
+
+# 5. Calculate testing set performance metrics
+calculate_metrics <- function(true, pred_mean, pred_lower, pred_upper) {
+  # RMSE for binary prob = Brier Score (Lower is better)
+  rmse <- sqrt(mean((true - pred_mean)^2))
+  mae <- mean(abs(true - pred_mean))
+  
+  # Convert probability to a hard prediction (Win or Loss)
+  # If Prob > 0.5, we predict 1 (Home Win). Otherwise 0.
+  pred_class <- ifelse(pred_mean > 0.5, 1, 0)
+  
+  # Check if prediction matches truth
+  # This returns a percentage (e.g., 0.65 = 65% correct)
+  accuracy <- mean(pred_class == true)
+  
+  # Coverage: Did the outcome (0 or 1) fall inside the Prob Interval?
+  # Note: For binary data, if interval is [0.4, 0.6], 0 and 1 are BOTH outside.
+  # So coverage might look low unless the interval is very wide.
+  mean_width <- mean(pred_upper - pred_lower)
+  
+  return(c(RMSE = rmse, MAE = mae, Accuracy = accuracy, Mean_Width = mean_width))
+}
+
+test_metrics <- calculate_metrics(
+  test_preds$true_temp, test_preds$mean, 
+  test_preds$lower_5, test_preds$upper_95
+)
+
+print(round(test_metrics, 3))
+```
+
+

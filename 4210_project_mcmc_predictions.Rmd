@@ -1,0 +1,179 @@
+---
+title: "4210 Final Project"
+output: pdf_document
+date: "2025-11-28"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Setup
+
+```{r}
+library(nflreadr)
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(purrr)
+library(tibble)
+library(readr)
+library(ggplot2)
+library(rstan)
+library(bayesplot)
+
+rstan_options(auto_write = TRUE)
+set.seed(123)
+```
+
+# Step 1: Data Prep
+
+```{r echo=FALSE}
+# 1. Load ALL data (History + Current Season)
+# We need 2023-2024 to learn "priors", and played 2025 games to learn "current form"
+all_games <- load_schedules(2023:2025) %>% 
+  filter(game_type == "REG")
+
+# 2. Create the Team Map (Ensure ID consistency across all years)
+teams <- sort(unique(c(all_games$home_team, all_games$away_team)))
+team_map <- data.frame(team = teams, id = 1:length(teams))
+
+# 3. Join IDs to the full dataset
+games_modeled <- all_games %>%
+  left_join(team_map, by = c("home_team" = "team")) %>%
+  rename(home_id = id) %>%
+  left_join(team_map, by = c("away_team" = "team")) %>%
+  rename(away_id = id)
+
+# 4. Define Training Data (Everything that HAS a result)
+train_data <- games_modeled %>%
+  filter(!is.na(result)) %>%
+  mutate(home_win = ifelse(result > 0, 1, 0))
+
+# 5. Define Future Data (Everything in 2025 with NO result)
+# This is what we want the model to predict in 'y_new_rep'
+future_data <- games_modeled %>%
+  filter(season == 2025 & is.na(result))
+
+# 6. Prepare data list for Stan
+# CRITICAL CHANGE: We pass 'future_data' into the "test" slots
+stan_data <- list(
+  N_train = nrow(train_data),
+  home_team_train = train_data$home_id,
+  away_team_train = train_data$away_id,
+  home_win_train = train_data$home_win,
+  
+  # The "Test" set is now the "Future" set
+  N_test = nrow(future_data),
+  home_team_test = future_data$home_id,
+  away_team_test = future_data$away_id,
+  
+  N_teams = nrow(team_map)
+)
+```
+
+# Step 2: MCMC with results
+
+```{r}
+# 2. Compile the Model
+stan_model_path <- "nfl_model.stan"
+stan_model_obj <- stan_model(file = stan_model_path)
+
+# 3. Run MCMC (Using YOUR method)
+fit <- sampling(
+  stan_model_obj, data = stan_data,
+  iter = 2000, warmup = 1000, chains = 4, seed = 4210,
+  control = list(adapt_delta = 0.9, max_treedepth = 10)
+)
+
+# Print results (Looking at Home Advantage 'alpha' and Variation 'sigma')
+print(fit, pars = c("alpha", "sigma"), probs = c(0.05, 0.5, 0.95))
+
+# 4. Extract posterior samples
+posterior <- rstan::extract(fit)
+posterior_array <- as.array(fit)
+future_data$projected_home_win_prob <- colMeans(posterior$y_new_rep)
+
+mcmc_trace(posterior_array, pars = c("alpha", "sigma"))
+mcmc_pairs(posterior_array, pars = c("alpha", "sigma"))
+
+# --- Step 5: Calculate Final 2025 Win Totals ---
+
+# A. Count "Banked Wins" (Games already won in 2025)
+banked_wins <- games_modeled %>%
+  filter(season == 2025, !is.na(result)) %>%
+  mutate(winner = ifelse(result > 0, home_team, away_team)) %>%
+  filter(result != 0) %>% # Exclude ties
+  count(winner, name = "wins_so_far")
+
+# B. Calculate "Future Wins" (Sum of probabilities)
+# If Prob(HomeWin) = 0.6, Home gets 0.6 wins, Away gets 0.4 wins
+future_wins_calc <- data.frame(team = team_map$team, expected_future_wins = 0)
+
+for(i in 1:nrow(future_data)) {
+  h_team <- future_data$home_team[i]
+  a_team <- future_data$away_team[i]
+  p_home <- future_data$projected_home_win_prob[i]
+  
+  # Add to Home Team
+  future_wins_calc$expected_future_wins[future_wins_calc$team == h_team] <- 
+    future_wins_calc$expected_future_wins[future_wins_calc$team == h_team] + p_home
+    
+  # Add to Away Team
+  future_wins_calc$expected_future_wins[future_wins_calc$team == a_team] <- 
+    future_wins_calc$expected_future_wins[future_wins_calc$team == a_team] + (1 - p_home)
+}
+
+# C. Combine for Final Report
+final_prediction <- banked_wins %>%
+  full_join(future_wins_calc, by = c("winner" = "team")) %>%
+  mutate(
+    wins_so_far = replace_na(wins_so_far, 0),
+    expected_future_wins = replace_na(expected_future_wins, 0),
+    total_projected_wins = wins_so_far + expected_future_wins
+  ) %>%
+  arrange(desc(total_projected_wins))
+
+# Print the Final Table for your Report
+print(final_prediction)
+```
+
+# Results in Histogram
+
+```{r}
+library(ggplot2)
+
+final_prediction %>%
+  # winner = team abbreviation column from your code
+  ggplot(aes(
+    x = reorder(winner, total_projected_wins), 
+    y = total_projected_wins
+  )) +
+  geom_col(fill = "steelblue")+
+  coord_flip() +
+  labs(
+    x = "Team",
+    y = "Total Wins",
+    title = "Projected 2025 Total Wins (Banked + Expected)"
+  ) +
+  theme_minimal()
+
+# --- Posterior Uncertainty Analysis (Ridge Plot) ---
+
+# 1. Extract the 'theta' (skill) samples
+# This gives a matrix of 4000 rows (simulations) x 32 columns (teams)
+theta_draws <- as.matrix(fit, pars = "theta")
+
+# 2. Map the column names from "theta[1]" to "Arizona Cardinals", etc.
+# (We assume team_map is sorted 1..32, which matches Stan's indexing)
+colnames(theta_draws) <- team_map$team
+
+# 3. Sort teams by their Median Skill to make the plot readable
+# Calculate median for every team
+team_medians <- apply(theta_draws, 2, median)
+
+# Pick the Top 15 teams to keep the chart clean (or show all if you prefer)
+# Sorting descending
+top_teams <- names(sort(team_medians, decreasing = TRUE))[1:15]
+theta_top <- theta_draws[, top_teams]
+```
