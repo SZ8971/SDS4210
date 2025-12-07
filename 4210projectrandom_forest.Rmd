@@ -1,0 +1,220 @@
+---
+title: "4210_project_rf"
+output: pdf_document
+date: "2025-11-29"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Start: Feature Engineering (Get the Stats)
+
+```{r}
+library(randomForest)
+library(nflreadr)
+library(dplyr)
+library(tidyr)
+
+# 1. Get Play-by-Play Data (This contains the "Stats")
+# Load all schedules
+
+all_games <- load_schedules(2023:2025) %>%
+filter(game_type == "REG")
+
+# Play-by-Play data for EPA stats
+
+pbp <- load_pbp(2023:2025)
+head(pbp)
+# Team Offensive EPA
+
+team_stats <- pbp %>%
+filter(!is.na(epa), !is.na(posteam)) %>%
+group_by(season, posteam) %>%
+summarize(
+avg_off_epa  = mean(epa, na.rm = TRUE),
+avg_pass_epa = mean(epa[pass == 1], na.rm = TRUE),
+avg_rush_epa = mean(epa[rush == 1], na.rm = TRUE),
+.groups = "drop"
+)
+
+# Handle NA in EPA stats (e.g., bye weeks early in season)
+
+team_stats <- team_stats %>%
+group_by(posteam) %>%
+tidyr::fill(avg_off_epa, avg_pass_epa, avg_rush_epa, .direction = "downup") %>%
+ungroup()
+
+# --- Compute Rest Days for Home / Away Teams (based on week gaps) ---
+games_with_rest <- all_games %>%
+  arrange(home_team, season, week) %>%      
+  group_by(home_team) %>%
+  mutate(home_rest = as.numeric(week - lag(week))) %>%   
+  ungroup() %>%
+  arrange(away_team, season, week) %>%
+  group_by(away_team) %>%
+  mutate(away_rest = as.numeric(week - lag(week))) %>%   
+  ungroup()
+
+```
+
+# Step 2: Train the Random Forest
+
+```{r}
+# Join EPA + Rest stats
+
+model_data_rf <- games_with_rest %>%
+filter(!is.na(result)) %>%      # Only completed games
+left_join(team_stats, by = c("season", "home_team" = "posteam")) %>%
+rename(home_off_epa = avg_off_epa,
+home_pass_epa = avg_pass_epa,
+home_rush_epa = avg_rush_epa) %>%
+left_join(team_stats, by = c("season", "away_team" = "posteam")) %>%
+rename(away_off_epa = avg_off_epa,
+away_pass_epa = avg_pass_epa,
+away_rush_epa = avg_rush_epa) %>%
+mutate(
+epa_diff  = home_off_epa - away_off_epa,
+rest_diff = home_rest - away_rest,
+home_win_label = case_when(
+result > 0 ~ "Win",
+result < 0 ~ "Loss",
+TRUE ~ "Tie"
+)
+) %>%
+filter(home_win_label != "Tie") %>%
+mutate(home_win = as.factor(home_win_label)) %>%
+select(season, home_win, epa_diff, rest_diff, home_pass_epa, away_pass_epa) %>%
+na.omit()
+
+```
+
+```{r}
+rf_model <- randomForest(
+home_win ~ epa_diff + rest_diff + home_pass_epa + away_pass_epa,
+data = model_data_rf,
+ntree = 500,
+importance = TRUE
+)
+
+rf_model
+varImpPlot(rf_model)
+
+
+```
+
+# Step 3: Predict the Future (2025)
+
+```{r}
+future_data <- games_with_rest %>%
+filter(season == 2025 & is.na(result))
+
+future_data_rf <- future_data %>%
+left_join(team_stats, by = c("season", "home_team" = "posteam")) %>%
+rename(home_off_epa = avg_off_epa,
+home_pass_epa = avg_pass_epa,
+home_rush_epa = avg_rush_epa) %>%
+left_join(team_stats, by = c("season", "away_team" = "posteam")) %>%
+rename(away_off_epa = avg_off_epa,
+away_pass_epa = avg_pass_epa,
+away_rush_epa = avg_rush_epa) %>%
+mutate(
+epa_diff  = home_off_epa - away_off_epa,
+rest_diff = home_rest - away_rest
+) %>%
+select(game_id, home_team, away_team, epa_diff, rest_diff, home_pass_epa, away_pass_epa)
+
+# Remove rows with missing values
+
+future_data_rf <- na.omit(future_data_rf)
+
+# Probability Predictions
+
+rf_preds <- predict(rf_model, newdata = future_data_rf, type = "prob")
+
+future_data_rf$rf_win_prob <- rf_preds[, "Win"]
+
+```
+
+
+# Step 4: 
+```{r}
+# Games already completed
+
+banked_wins <- all_games %>%
+filter(season == 2025, !is.na(result)) %>%
+mutate(winner = ifelse(result > 0, home_team, away_team)) %>%
+filter(result != 0) %>%
+count(winner, name = "wins_so_far")
+
+# Expected future wins
+
+future_wins_calc <- data.frame(team = unique(all_games$home_team),
+expected_future_wins = 0)
+
+for(i in 1:nrow(future_data_rf)){
+h <- future_data_rf$home_team[i]
+a <- future_data_rf$away_team[i]
+p <- future_data_rf$rf_win_prob[i]
+
+future_wins_calc$expected_future_wins[future_wins_calc$team == h] <-
+future_wins_calc$expected_future_wins[future_wins_calc$team == h] + p
+
+future_wins_calc$expected_future_wins[future_wins_calc$team == a] <-
+future_wins_calc$expected_future_wins[future_wins_calc$team == a] + (1 - p)
+}
+
+# Combine
+
+final_rf_prediction <- banked_wins %>%
+full_join(future_wins_calc, by = c("winner" = "team")) %>%
+mutate(
+wins_so_far = replace_na(wins_so_far, 0),
+total_projected_wins = wins_so_far + expected_future_wins
+) %>%
+arrange(desc(total_projected_wins))
+
+final_rf_prediction
+
+
+library(ggplot2)
+
+ggplot(final_rf_prediction, 
+       aes(x = reorder(winner, total_projected_wins), 
+           y = total_projected_wins)) +
+  geom_col(fill = "#4DA1FF", alpha = 0.9) +
+  coord_flip() +
+  labs(
+    title = "Total Projected Wins for Each NFL Team (Random Forest)",
+    x = "Team",
+    y = "Expected Wins"
+  ) +
+  theme_minimal(base_size = 12)
+
+
+```
+
+
+
+
+
+# accuracy
+
+```{r}
+train_backtest <- model_data_rf %>% filter(season < 2025)
+test_backtest  <- model_data_rf %>% filter(season == 2025)
+
+rf_backtest <- randomForest(
+home_win ~ epa_diff + rest_diff + home_pass_epa + away_pass_epa,
+data = train_backtest,
+ntree = 300
+)
+
+preds <- predict(rf_backtest, newdata = test_backtest)
+conf <- table(Predicted = preds, Actual = test_backtest$home_win)
+
+accuracy <- sum(diag(conf)) / sum(conf)
+
+conf
+accuracy
+```
